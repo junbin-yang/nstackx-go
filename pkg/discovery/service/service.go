@@ -1,4 +1,4 @@
-// Package service 实现设备发现的核心服务，整合CoAP通信、设备管理、网络管理等能力
+// 设备发现的核心服务，整合CoAP通信、设备管理、网络管理等能力
 package service
 
 import (
@@ -9,10 +9,10 @@ import (
 	"time"
 
 	"github.com/junbin-yang/nstackx-go/api"
-	"github.com/junbin-yang/nstackx-go/pkg/discovery/coap"   // 依赖CoAP协议模块
-	"github.com/junbin-yang/nstackx-go/pkg/discovery/device" // 依赖设备管理模块
-	"github.com/junbin-yang/nstackx-go/pkg/network"          // 依赖网络管理模块
-	"github.com/junbin-yang/nstackx-go/pkg/utils/logger"     // 依赖日志工具
+	"github.com/junbin-yang/nstackx-go/pkg/discovery/coap"
+	"github.com/junbin-yang/nstackx-go/pkg/discovery/device"
+	"github.com/junbin-yang/nstackx-go/pkg/network"
+	"github.com/junbin-yang/nstackx-go/pkg/utils/logger"
 	"go.uber.org/zap"
 )
 

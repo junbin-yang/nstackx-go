@@ -10,10 +10,12 @@ import (
 type DiscoveryMode uint8
 const (
 	ModeDefault   DiscoveryMode = 0
-	ModeDiscover  DiscoveryMode = 1
-	ModePublish   DiscoveryMode = 2
-	ModeOffline   DiscoveryMode = 3
-	ModeProactive DiscoveryMode = 10
+    	ModeActive    DiscoveryMode = 1
+    	ModePassive   DiscoveryMode = 2
+    	ModeDiscover  DiscoveryMode = 3
+    	ModePublish   DiscoveryMode = 4
+    	ModeOffline   DiscoveryMode = 5
+    	ModeProactive DiscoveryMode = 10
 )
 
 // 发现类型

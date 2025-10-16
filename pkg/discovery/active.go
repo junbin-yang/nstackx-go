@@ -10,9 +10,9 @@ import (
 	"time"
 
 	"github.com/junbin-yang/nstackx-go/api"
-	"github.com/junbin-yang/nstackx-go/pkg/discovery/coap"    // 依赖CoAP协议模块（组播、编解码）
-	"github.com/junbin-yang/nstackx-go/pkg/discovery/protocol" // 依赖业务层协议模块（设备消息结构）
-	"github.com/junbin-yang/nstackx-go/pkg/utils/logger"     
+	"github.com/junbin-yang/nstackx-go/pkg/discovery/coap"
+	"github.com/junbin-yang/nstackx-go/pkg/discovery/protocol"
+	"github.com/junbin-yang/nstackx-go/pkg/utils/logger"
 	"go.uber.org/zap"
 )
 

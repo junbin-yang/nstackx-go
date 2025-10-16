@@ -172,9 +172,14 @@ func (e *Encoder) Decode(data []byte) (*RawMessage, error) {
 	}
 
 	// 3. 解码选项（Options）与负载（Payload）（读取剩余所有数据）
-	remaining := make([]byte, reader.Len())
-	if _, err := reader.Read(remaining); err != nil {
-		return nil, fmt.Errorf("读取剩余数据（选项+负载）失败: %w", err)
+	var remaining []byte
+	if reader.Len() > 0 {
+    		remaining = make([]byte, reader.Len())
+    		if _, err := reader.Read(remaining); err != nil {
+        		return nil, fmt.Errorf("读取剩余数据（选项+负载）失败: %w", err)
+    		}
+	} else {
+    		remaining = []byte{} // 无剩余数据时直接赋空切片
 	}
 
 	// 查找负载分隔符（0xFF），区分选项与负载

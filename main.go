@@ -11,7 +11,7 @@ import (
 
 	"github.com/junbin-yang/nstackx-go/api"
 	"github.com/junbin-yang/nstackx-go/pkg/discovery/service"
-	"github.com/junbin-yang/nstackx-go/pkg/utils/logger"
+	log "github.com/junbin-yang/nstackx-go/pkg/utils/logger"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
@@ -27,7 +27,7 @@ var (
 	config  api.Config // 服务配置结构体
 
 	// 日志实例
-	logger *logger.Logger
+	logger *log.Logger
 )
 
 // rootCmd 表示基础命令（默认命令）
@@ -113,7 +113,7 @@ func initConfig() {
 	}
 
 	// 初始化日志（开发环境配置）
-	logger = logger.Debug()
+	logger = log.Default()
 }
 
 // runServer 执行root命令：启动NStackX服务，运行设备发现并处理中断信号

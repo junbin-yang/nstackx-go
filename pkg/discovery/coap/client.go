@@ -7,27 +7,30 @@ import (
 	"net"
 	"sync"
 	"time"
+	"bytes"
 
 	"github.com/junbin-yang/nstackx-go/pkg/network"
+	"github.com/junbin-yang/nstackx-go/pkg/discovery/protocol"
 	"github.com/junbin-yang/nstackx-go/pkg/utils/logger"
-	"github.com/plgd-dev/go-coap/v3/message"
+	"github.com/plgd-dev/go-coap/v3/message/pool"
 	"github.com/plgd-dev/go-coap/v3/message/codes"
+	"github.com/plgd-dev/go-coap/v3/udp/client"
 	"github.com/plgd-dev/go-coap/v3/udp"
 	"go.uber.org/zap"
 )
 
 const (
-	MulticastIPv4  = "224.0.1.187"   // IPv4组播地址（CoAP标准组播地址）
-	MulticastIPv6  = "ff02::1"       // IPv6组播地址
-	BroadcastPort  = 5683            // CoAP默认端口
-	DefaultTimeout = 5 * time.Second // 默认超时时间
+	MulticastIPv4   = "224.0.1.187"   // IPv4组播地址（CoAP标准组播地址）
+	MulticastIPv6   = "ff02::1"       // IPv6组播地址
+	BroadcastPort   = 5683            // CoAP默认端口
+	DefaultTimeout  = 5 * time.Second // 默认超时时间
 )
 
 // Client 表示一个CoAP客户端实例
 type Client struct {
 	mu sync.RWMutex // 读写锁，用于保护并发访问的资源
 
-	conn      *udp.ClientConn  // CoAP UDP连接实例
+	conn      *client.Conn     // CoAP UDP连接实例
 	multicast net.PacketConn   // 组播连接
 	timeout   time.Duration    // 超时时间设置
 	log       *logger.Logger   // 日志实例
@@ -147,9 +150,10 @@ func (c *Client) SendUnicast(ip net.IP, port int, data []byte) error {
 	defer conn.Close()
 
 	// 创建CoAP消息
-	msg := conn.NewMessage(ctx)
+	msg := pool.NewMessage(ctx)
 	msg.SetCode(codes.POST)               // 设置消息类型为POST
-	msg.SetBody(message.ByteString(data)) // 设置消息体
+	msg.SetPath(DeviceResponsePath)
+	msg.SetBody(bytes.NewReader(data)) // 设置消息体
 
 	// 发送消息
 	if err := conn.WriteMessage(msg); err != nil {
@@ -187,8 +191,9 @@ func (c *Client) SendDiscoveryRequest(ip net.IP) error {
 	defer conn.Close()
 
 	// 创建CoAP消息
-	msg := conn.NewMessage(ctx)
+	msg := pool.NewMessage(ctx)
 	msg.SetCode(codes.GET) // 设置消息类型为GET
+   	msg.SetPath(DeviceDiscoverPath)
 
 	// 发送消息并等待响应
 	resp, err := conn.Do(msg)

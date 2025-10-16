@@ -6,12 +6,16 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"bytes"
 
 	"github.com/junbin-yang/nstackx-go/pkg/utils/logger"
 	"github.com/plgd-dev/go-coap/v3/message"
 	"github.com/plgd-dev/go-coap/v3/message/codes"
 	"github.com/plgd-dev/go-coap/v3/mux"
 	"github.com/plgd-dev/go-coap/v3/udp"
+	"github.com/plgd-dev/go-coap/v3/udp/server"
+	"github.com/plgd-dev/go-coap/v3/options"
+	coapNet "github.com/plgd-dev/go-coap/v3/net"
 	"go.uber.org/zap"
 )
 
@@ -42,7 +46,7 @@ type Server struct {
 	mu sync.RWMutex // 读写锁，保障多协程并发访问服务器资源的安全性
 
 	port     int                // 服务器监听端口（默认5683）
-	listener *udp.Server        // UDP模式的CoAP服务器（基于go-coap/udp）
+	listener *server.Server     // UDP模式的CoAP服务器（基于go-coap/udp）
 	router   *mux.Router        // CoAP请求路由器（用于路径与处理器的映射）
 	handler  MessageHandler     // 外部设置的消息处理回调函数
 	ctx      context.Context    // 服务器上下文，用于控制生命周期
@@ -105,20 +109,20 @@ func (s *Server) Start() error {
 
 	// 构建监听地址（":端口"，监听所有网卡的该端口）
 	addr := fmt.Sprintf(":%d", s.port)
-
-	var err error
-	// 创建UDP模式的CoAP服务器：关联路由和上下文
-	s.listener, err = udp.NewServer(
-		udp.WithMux(s.router),  // 绑定路由（请求分发依据）
-		udp.WithContext(s.ctx), // 绑定上下文（生命周期控制）
-	)
+	conn, err := coapNet.NewListenUDP("udp", addr)
 	if err != nil {
-		return fmt.Errorf("创建UDP服务器失败: %w", err)
-	}
+                return fmt.Errorf("服务端口监听失败")
+        }
+
+	// 创建UDP模式的CoAP服务器：关联路由和上下文
+	s.listener = udp.NewServer(
+		options.WithMux(s.router),  // 绑定路由（请求分发依据）
+		options.WithContext(s.ctx), // 绑定上下文（生命周期控制）
+	)
 
 	// 启动协程监听请求（非阻塞，避免阻塞当前函数）
 	go func() {
-		if err := s.listener.Serve(addr); err != nil {
+		if err := s.listener.Serve(conn); err != nil {
 			s.log.Error("CoAP服务器运行错误", zap.Error(err))
 		}
 	}()
@@ -159,10 +163,10 @@ func (s *Server) SetPort(port int) {
 // 功能：解析请求，调用外部回调，返回资源列表响应
 func (s *Server) handleDiscovery(w mux.ResponseWriter, r *mux.Message) {
 	s.log.Debug("收到资源发现请求",
-		zap.String("来源", r.Client().RemoteAddr().String()))
+		zap.String("来源", w.Conn().RemoteAddr().String()))
 
 	// 解析请求为自定义Message结构
-	msg := s.parseMessage(r, DiscoveryPath)
+	msg := s.parseMessage(w, r, DiscoveryPath)
 
 	// 调用外部消息处理回调（传递解析后的消息）
 	if s.handler != nil {
@@ -170,19 +174,27 @@ func (s *Server) handleDiscovery(w mux.ResponseWriter, r *mux.Message) {
 	}
 
 	// 构建响应：状态码2.05 Content（成功），内容格式为文本，负载为资源列表
-	response := w.SetResponse(codes.Content, message.TextPlain, nil)
+	response := w.Conn().AcquireMessage(r.Context())
+	defer w.Conn().ReleaseMessage(response)
+	response.SetCode(codes.Content)
+        response.SetToken(r.Token())
+	response.SetContentFormat(message.TextPlain)
 	// 设置响应体（调用buildDiscoveryResponse生成资源列表）
-	response.SetBody(bytes(s.buildDiscoveryResponse()))
+	response.SetBody(bytes.NewReader(s.buildDiscoveryResponse()))
+	err := w.Conn().WriteMessage(response)
+	if err != nil {
+		s.log.Error("设置响应数据错误", zap.Error(err))
+	}
 }
 
 // handleDeviceDiscover 处理设备发现请求（路径：/device/discover）
 // 功能：解析请求，调用外部回调，返回确认响应
 func (s *Server) handleDeviceDiscover(w mux.ResponseWriter, r *mux.Message) {
 	s.log.Debug("收到设备发现请求",
-		zap.String("来源", r.Client().RemoteAddr().String()))
+		zap.String("来源", w.Conn().RemoteAddr().String()))
 
 	// 解析请求为自定义Message结构
-	msg := s.parseMessage(r, DeviceDiscoverPath)
+	msg := s.parseMessage(w, r, DeviceDiscoverPath)
 
 	// 调用外部消息处理回调
 	if s.handler != nil {
@@ -197,10 +209,10 @@ func (s *Server) handleDeviceDiscover(w mux.ResponseWriter, r *mux.Message) {
 // 功能：解析设备回复的发现响应，调用外部回调，返回确认
 func (s *Server) handleDeviceResponse(w mux.ResponseWriter, r *mux.Message) {
 	s.log.Debug("收到设备响应消息",
-		zap.String("来源", r.Client().RemoteAddr().String()))
+		zap.String("来源", w.Conn().RemoteAddr().String()))
 
 	// 解析请求为自定义Message结构
-	msg := s.parseMessage(r, DeviceResponsePath)
+	msg := s.parseMessage(w, r, DeviceResponsePath)
 
 	// 调用外部消息处理回调
 	if s.handler != nil {
@@ -215,10 +227,10 @@ func (s *Server) handleDeviceResponse(w mux.ResponseWriter, r *mux.Message) {
 // 功能：解析设备状态变更通知，调用外部回调，返回确认
 func (s *Server) handleNotification(w mux.ResponseWriter, r *mux.Message) {
 	s.log.Debug("收到通知消息",
-		zap.String("来源", r.Client().RemoteAddr().String()))
+		zap.String("来源", w.Conn().RemoteAddr().String()))
 
 	// 解析请求为自定义Message结构
-	msg := s.parseMessage(r, NotificationPath)
+	msg := s.parseMessage(w, r, NotificationPath)
 
 	// 调用外部消息处理回调
 	if s.handler != nil {
@@ -231,12 +243,12 @@ func (s *Server) handleNotification(w mux.ResponseWriter, r *mux.Message) {
 
 // parseMessage 将go-coap库的mux.Message转换为自定义Message结构
 // 功能：提取消息关键信息（码、令牌、负载、来源地址等），简化外部处理
-func (s *Server) parseMessage(r *mux.Message, path string) *Message {
+func (s *Server) parseMessage(w mux.ResponseWriter, r *mux.Message, path string) *Message {
 	// 读取消息负载（业务数据）
 	payload, _ := r.ReadBody()
 
 	// 获取消息来源地址（转换为UDP地址，提取IP和端口）
-	addr := r.Client().RemoteAddr().(*net.UDPAddr)
+	addr := w.Conn().RemoteAddr().(*net.UDPAddr)
 
 	// 构建并返回自定义Message
 	return &Message{
@@ -257,7 +269,3 @@ func (s *Server) buildDiscoveryResponse() []byte {
 	return []byte(`</device>;rt="nstackx.device"`)
 }
 
-// bytes 辅助函数：将字符串转换为字节切片（简化响应体设置）
-func bytes(s string) []byte {
-	return []byte(s)
-}
