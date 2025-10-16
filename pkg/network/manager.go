@@ -8,22 +8,22 @@ import (
 	"time"
 
 	"github.com/junbin-yang/nstackx-go/pkg/utils/logger"
-        "go.uber.org/zap"
+	"go.uber.org/zap"
 )
 
 // InterfaceInfo 表示网络接口的详细信息
 type InterfaceInfo struct {
-	Name      string          	// 接口名称（如eth0、lo等）
-	Index     int             	// 接口索引（系统分配的唯一标识）
-	Flags     net.Flags       	// 接口标志（如是否启用、是否为回环等）
-	Addresses []net.IP        	// 接口关联的IP地址列表
-	MAC       net.HardwareAddr 	// 接口的MAC地址
-	MTU       int 			// 接口的最大传输单元(MTU)
+	Name      string           // 接口名称（如eth0、lo等）
+	Index     int              // 接口索引（系统分配的唯一标识）
+	Flags     net.Flags        // 接口标志（如是否启用、是否为回环等）
+	Addresses []net.IP         // 接口关联的IP地址列表
+	MAC       net.HardwareAddr // 接口的MAC地址
+	MTU       int              // 接口的最大传输单元(MTU)
 }
 
 // Manager 用于管理网络接口，提供接口信息的扫描、监控和查询功能
 type Manager struct {
-	mu sync.RWMutex          	     // 读写锁，保证并发安全
+	mu sync.RWMutex // 读写锁，保证并发安全
 
 	interfaces map[string]*InterfaceInfo // 存储接口信息，键为接口名称
 	monitoring bool                      // 标识是否正在监控接口
