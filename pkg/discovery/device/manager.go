@@ -13,9 +13,9 @@ type Manager struct {
 	mu sync.RWMutex // 读写锁，保证多协程访问时的数据安全
 
 	devices     map[string]*api.DeviceInfo // 存储设备的映射表，键为设备唯一标识DeviceID
-	maxDevices  uint32                    // 最大设备数量限制，超过时会移除最旧设备
-	agingTime   time.Duration             // 设备老化时间，超过此时长未更新的设备会被清理
-	deviceOrder []string                  // 维护设备插入顺序的切片，用于在设备满时移除最旧设备
+	maxDevices  uint32                     // 最大设备数量限制，超过时会移除最旧设备
+	agingTime   time.Duration              // 设备老化时间，超过此时长未更新的设备会被清理
+	deviceOrder []string                   // 维护设备插入顺序的切片，用于在设备满时移除最旧设备
 }
 
 // NewManager 创建一个新的设备管理器
@@ -44,18 +44,29 @@ func (m *Manager) UpdateDevice(device *api.DeviceInfo) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if device == nil {
+	if device == nil || device.DeviceID == "" {
 		return false
 	}
 
-	// 更新设备最后出现时间为当前时间
+	// 已存在则就地更新并刷新时间戳，避免替换指针导致状态丢失
+	if existing, exists := m.devices[device.DeviceID]; exists {
+		// 合并关键字段（根据实际需要可扩展）
+		if device.DeviceName != "" {
+			existing.DeviceName = device.DeviceName
+		}
+		if device.NetworkIP != nil {
+			existing.NetworkIP = device.NetworkIP
+		}
+		if len(device.CapabilityBitmap) > 0 {
+			existing.CapabilityBitmap = device.CapabilityBitmap
+		}
+		// 刷新最后出现时间
+		existing.LastSeenTime = time.Now()
+		return false
+	}
+
+	// 新设备：设置时间戳并插入
 	device.LastSeenTime = time.Now()
-
-	// 检查设备是否已存在，存在则更新
-	if _, exists := m.devices[device.DeviceID]; exists {
-		m.devices[device.DeviceID] = device
-		return false
-	}
 
 	// 若设备数量已达上限，移除最旧的设备（按插入顺序）
 	if uint32(len(m.devices)) >= m.maxDevices {
@@ -66,7 +77,6 @@ func (m *Manager) UpdateDevice(device *api.DeviceInfo) bool {
 		}
 	}
 
-	// 添加新设备
 	m.devices[device.DeviceID] = device
 	m.deviceOrder = append(m.deviceOrder, device.DeviceID) // 记录插入顺序
 
@@ -244,4 +254,3 @@ func (m *Manager) UpdateDeviceField(deviceID string, updater func(*api.DeviceInf
 	device.LastSeenTime = time.Now()
 	return true
 }
-

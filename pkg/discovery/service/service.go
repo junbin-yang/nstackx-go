@@ -3,16 +3,21 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
+	//"reflect"
+	//"strings"
 	"sync"
 	"time"
 
 	"github.com/junbin-yang/nstackx-go/api"
 	"github.com/junbin-yang/nstackx-go/pkg/discovery/coap"
 	"github.com/junbin-yang/nstackx-go/pkg/discovery/device"
+	"github.com/junbin-yang/nstackx-go/pkg/discovery/protocol"
 	"github.com/junbin-yang/nstackx-go/pkg/network"
 	"github.com/junbin-yang/nstackx-go/pkg/utils/logger"
+	//"github.com/plgd-dev/go-coap/v3/message/codes"
 	"go.uber.org/zap"
 )
 
@@ -24,10 +29,11 @@ type DiscoveryService struct {
 	config *api.Config
 
 	// Core components 核心组件（服务依赖的基础能力）
-	deviceManager *device.Manager  // 设备管理器：维护本地/远程设备列表，清理过期设备
-	coapServer    *coap.Server     // CoAP服务端：接收外部设备的CoAP消息（如设备响应）
-	coapClient    *coap.Client     // CoAP客户端：发送CoAP广播/单播消息（如发现请求）
-	networkMgr    *network.Manager // 网络管理器：监控网络接口状态，管理网络连接
+	deviceManager *device.Manager        // 设备管理器：维护本地/远程设备列表，清理过期设备
+	coapServer    *coap.Server           // CoAP服务端：接收外部设备的CoAP消息（如设备响应）
+	coapClient    *coap.Client           // CoAP客户端：发送CoAP广播/单播消息（如发现请求）
+	multicast     *coap.MulticastHandler // 组播处理器：加入组播组、监听并发送组播
+	networkMgr    *network.Manager       // 网络管理器：监控网络接口状态，管理网络连接
 
 	// Runtime state 服务运行状态
 	ctx           context.Context    // 服务上下文，用于控制后台协程退出
@@ -90,35 +96,34 @@ func (s *DiscoveryService) initComponents() error {
 		return fmt.Errorf("创建网络管理器失败: %w", err)
 	}
 
-	// 3. 初始化CoAP服务端：绑定消息处理函数（接收消息后调用handleCoapMessage）
-	s.coapServer, err = coap.NewServer(s.handleCoapMessage)
+	// 3. 初始化组播处理器：用于按接口加入/监听组播与发送组播
+	var mcErr error
+	s.multicast, mcErr = coap.NewMulticastHandler(nil, s.networkMgr)
+	if mcErr != nil {
+		return fmt.Errorf("创建组播处理器失败: %w", mcErr)
+	}
+
+	// 4. 初始化CoAP客户端：用于发送发现广播/单播消息
+	s.coapClient = coap.NewClient(s.networkMgr, s.multicast)
+
+	// 5. 初始化CoAP服务端：绑定消息处理函数（接收消息后调用handleCoapMessage）
+	s.coapServer, err = coap.NewServer(s.handleCoapMessage, s.multicast)
 	if err != nil {
 		return fmt.Errorf("创建CoAP服务端失败: %w", err)
 	}
 
-	// 4. 初始化CoAP客户端：用于发送发现广播/单播消息
-	s.coapClient = coap.NewClient(s.networkMgr)
-
-	return nil
-}
-
-// Init 重新初始化服务配置（需在服务未运行时调用）
-// 参数：config - 新的服务配置
-// 返回：若服务已运行则返回错误
-func (s *DiscoveryService) Init(config *api.Config) error {
-	s.mu.Lock()         // 写锁：保障配置更新时的线程安全
-	defer s.mu.Unlock() // 函数退出时释放锁
-
-	// 服务运行中不允许重新初始化
-	if s.isRunning {
-		return fmt.Errorf("服务已运行，无法重新初始化")
+	l := s.config.LogLevel // 设置日志级别
+	if l == "debug" {
+		s.log.SetLevel(logger.DebugLevel)
+	} else if l == "info" {
+		s.log.SetLevel(logger.InfoLevel)
+	} else if l == "warn" {
+		s.log.SetLevel(logger.WarnLevel)
+	} else if l == "error" {
+		s.log.SetLevel(logger.ErrorLevel)
+	} else if l == "fatal" {
+		s.log.SetLevel(logger.FatalLevel)
 	}
-
-	// 更新服务配置
-	s.config = config
-	s.log.Info("初始化设备发现服务",
-		zap.String("设备ID", config.LocalDevice.DeviceID),
-		zap.String("设备名称", config.LocalDevice.Name))
 
 	return nil
 }
@@ -136,10 +141,11 @@ func (s *DiscoveryService) Start() error {
 
 	s.log.Info("启动设备发现服务")
 
-	// 1. 启动CoAP服务端：开始监听CoAP请求（默认端口5683）
-	if err := s.coapServer.Start(); err != nil {
-		return fmt.Errorf("启动CoAP服务端失败: %w", err)
-	}
+	// 1. 启动CoAP服务端：当未启用组播处理器时，监听默认端口5683
+	//if err := s.coapServer.Start(); err != nil {
+	//	return fmt.Errorf("启动CoAP服务端失败: %w", err)
+	//}
+	s.coapServer.Start()
 
 	// 2. 启动网络管理器：开始监控网络接口状态
 	if err := s.networkMgr.Start(); err != nil {
@@ -174,7 +180,6 @@ func (s *DiscoveryService) Stop() error {
 	// 1. 取消上下文：通知所有后台协程（discoveryWorker/cleanupWorker）退出
 	s.cancel()
 
-	// 2. 停止核心组件
 	s.coapServer.Stop() // 停止CoAP服务端（关闭监听）
 	s.networkMgr.Stop() // 停止网络管理器（停止网络监控）
 
@@ -283,6 +288,7 @@ func (s *DiscoveryService) StopDiscovery() error {
 	return nil
 }
 
+/*
 // SendMessage 向指定远程设备发送消息（基于设备ID）
 // 参数：deviceID - 目标设备ID；data - 待发送的消息数据
 // 返回：若设备未找到或发送失败则返回错误
@@ -301,8 +307,9 @@ func (s *DiscoveryService) SendMessage(deviceID string, data []byte) error {
 		zap.Int("消息长度", len(data)))
 
 	// 通过CoAP客户端向设备的网络IP发送消息（使用默认CoAP端口）
-	return s.coapClient.SendMessage(device.NetworkIP, data)
+	return s.coapClient.SendUnicast(device.NetworkIP, data)
 }
+*/
 
 // RegisterCallbacks 注册外部回调函数（用于感知设备状态变化）
 // 参数：callbacks - 外部实现的回调函数（如OnDeviceFound/OnDeviceLost）
@@ -373,9 +380,15 @@ func (s *DiscoveryService) performDiscovery() {
 
 	// 1. 构建发现消息（待实现：按协议格式封装本地设备信息）
 	msg := s.buildDiscoveryMessage()
-	// 2. 通过CoAP客户端发送广播消息（向所有支持组播的网络接口发送）
-	if err := s.coapClient.SendBroadcast(msg); err != nil {
-		s.log.Error("发送发现广播失败", zap.Error(err))
+	// 2. 通过组播处理器/客户端发送广播消息（向所有支持组播的网络接口发送）
+	var sendErr error
+	if s.multicast != nil {
+		sendErr = s.multicast.SendMulticast(msg)
+	} else {
+		sendErr = s.coapClient.SendBroadcast(msg)
+	}
+	if sendErr != nil {
+		s.log.Error("发送发现广播失败", zap.Error(sendErr))
 		s.stats.Errors++ // 统计错误数+1
 	}
 }
@@ -406,7 +419,19 @@ func (s *DiscoveryService) handleCoapMessage(msg *coap.Message) {
 	// 更新统计信息：接收消息数+1
 	s.stats.MessagesReceived++
 
-	// 1. 从CoAP消息中解析设备信息（待实现：按协议格式解析payload）
+	// 仅处理合法 JSON 负载；自动回复逻辑在组播消费处已做，避免重复
+	if msg == nil || msg.Payload == nil || !json.Valid(msg.Payload) {
+		return
+	}
+	if pmsg, derr := protocol.Decode(msg.Payload); derr != nil {
+		s.log.Error("解析设备信息失败", zap.Error(fmt.Errorf("解码协议消息失败: %w", derr)))
+		s.stats.Errors++
+		return
+	} else {
+		_ = pmsg // 后续 parseDeviceInfo 会再次解码，保持最小改动
+	}
+
+	// 1. 从CoAP消息中解析设备信息（按协议格式解析payload）
 	deviceInfo, err := s.parseDeviceInfo(msg)
 	if err != nil {
 		s.log.Error("解析设备信息失败", zap.Error(err))
@@ -434,26 +459,126 @@ func (s *DiscoveryService) handleCoapMessage(msg *coap.Message) {
 	}
 }
 
-// buildDiscoveryMessage 构建设备发现消息（待实现）
-// 功能：按协议格式封装本地设备信息（如设备ID、能力、网络信息）
-// 返回：待发送的消息字节流（当前返回空，需后续实现）
+// buildDiscoveryMessage 构建设备发现消息
+// 功能：按协议格式封装本地设备信息（如设备ID、能力、网络信息），并编码为JSON
 func (s *DiscoveryService) buildDiscoveryMessage() []byte {
-	// TODO: 待实现：根据协议规范构建发现消息（如JSON格式的设备信息）
-	return []byte{}
+	// 1) 构造协议层发现消息（填充默认接口信息，便于对端直接通信）
+	pmsg := protocol.NewDiscoverMessage(&s.config.LocalDevice)
+	if s.networkMgr != nil {
+		if def, err := s.networkMgr.GetDefaultInterface(); err == nil && def != nil {
+			pmsg.DeviceInfo.NetworkName = def.Name
+			for _, ip := range def.Addresses {
+				if ip.To4() != nil && !ip.IsLoopback() {
+					pmsg.DeviceInfo.NetworkIP = ip.String()
+					break
+				}
+			}
+		}
+	}
+	data, err := pmsg.Encode()
+	if err != nil {
+		s.log.Error("编码发现消息失败", zap.Error(err))
+		s.stats.Errors++
+		return []byte{}
+	}
+
+	// 2) 构建 CoAP 报文：NON，GET，设置 Uri-Path 为设备发现端点
+	encoder := coap.NewEncoder()
+	// 0x01 = GET
+	raw := coap.CreateMessage(coap.TypeNonConfirmable, 0x01, uint16(time.Now().UnixNano()%65536))
+	// Uri-Path 分段添加："device", "discover"
+	raw.AddOption(coap.OptionUriPath, []byte("device"))
+	raw.AddOption(coap.OptionUriPath, []byte("discover"))
+	// 声明负载格式为JSON（50）
+	raw.AddOption(coap.OptionContentFormat, []byte{coap.ContentFormatJSON})
+	raw.SetPayload(data)
+
+	encoded, err := encoder.Encode(raw)
+	if err != nil {
+		s.log.Error("编码CoAP发现报文失败", zap.Error(err))
+		s.stats.Errors++
+		return []byte{}
+	}
+	return encoded
 }
 
 // parseDeviceInfo 从CoAP消息中解析设备信息（待实现）
 // 参数：msg - 接收的CoAP消息（含设备发送的payload）
 // 返回：解析后的设备信息，解析失败则返回错误
 func (s *DiscoveryService) parseDeviceInfo(msg *coap.Message) (*api.DeviceInfo, error) {
-	// TODO: 待实现：从消息payload中解析设备信息（如设备ID、IP、能力等）
-	return &api.DeviceInfo{}, nil
+	if msg == nil || msg.Payload == nil {
+		return nil, fmt.Errorf("空消息或负载")
+	}
+
+	// 1. 解码协议消息
+	pmsg, err := protocol.Decode(msg.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("解码协议消息失败: %w", err)
+	}
+
+	// 2. 校验消息合法性
+	if err := pmsg.Validate(); err != nil {
+		return nil, fmt.Errorf("协议消息校验失败: %w", err)
+	}
+
+	// 3. 转换为 API 层设备信息
+	device, err := pmsg.ToDeviceInfo()
+	if err != nil {
+		return nil, fmt.Errorf("协议消息转换设备信息失败: %w", err)
+	}
+
+	// 4. 补充来源网络IP（若协议未提供或解析为空）
+	if device.NetworkIP == nil && msg.SourceIP != nil {
+		device.NetworkIP = msg.SourceIP
+	}
+
+	return device, nil
 }
 
-// sendDiscoveryMessages 根据设置发送多次发现消息（待实现）
-// 参数：settings - 发现设置（如广播次数、间隔等）
+// sendDiscoveryMessages 根据设置发送多次发现消息
+// 参数：settings - 发现设置（如广播次数、间隔、持续时间）
 func (s *DiscoveryService) sendDiscoveryMessages(settings *api.DiscoverySettings) {
-	// TODO: 待实现：按settings.AdvertiseCount发送指定次数的发现消息，支持间隔控制
+	start := time.Now()
+
+	for i := uint32(0); i < settings.AdvertiseCount; i++ {
+		// 若设置了总持续时间且已超时，则提前退出
+		if settings.AdvertiseDuration > 0 && time.Since(start) >= settings.AdvertiseDuration {
+			s.log.Debug("发现广播达到持续时间上限，提前结束",
+				zap.Duration("持续时间", settings.AdvertiseDuration))
+			break
+		}
+
+		// 构建发现消息
+		payload := s.buildDiscoveryMessage()
+		if len(payload) == 0 {
+			s.log.Error("构建发现消息失败，跳过本次广播")
+			s.stats.Errors++
+		} else {
+			// 发送广播（优先使用组播处理器）
+			err := s.multicast.SendMulticast(payload)
+			if err != nil {
+				s.log.Error("发送发现广播失败", zap.Error(err))
+				s.stats.Errors++
+			} else {
+				s.stats.MessagesSent++
+				s.log.Debug("已发送发现广播",
+					zap.Uint32("次数索引", i+1),
+					zap.Uint32("总次数", settings.AdvertiseCount))
+			}
+		}
+
+		// 间隔等待或服务停止退出
+		interval := settings.AdvertiseInterval
+		if interval <= 0 {
+			interval = 1 * time.Second
+		}
+		select {
+		case <-s.ctx.Done():
+			s.log.Debug("服务停止，发现广播协程退出")
+			return
+		case <-time.After(interval):
+		}
+	}
 }
 
 // ------------------------------ 待实现的接口方法 ------------------------------
@@ -461,7 +586,83 @@ func (s *DiscoveryService) sendDiscoveryMessages(settings *api.DiscoverySettings
 // 参数：remoteIP - 远程设备IP；businessData - 业务数据（如本地设备信息）
 // 返回：待实现
 func (s *DiscoveryService) SendDiscoveryResponse(remoteIP net.IP, businessData string) error {
-	// TODO: 待实现：构建CoAP响应消息，向remoteIP发送
+	// 使用默认 zone 的公共入口（保留原签名）
+	return s.sendDiscoveryResponseWithZone(remoteIP, businessData, "")
+}
+
+// 内部方法：带 zone 的发现响应，优先走 MulticastHandler 统一发送
+func (s *DiscoveryService) sendDiscoveryResponseWithZone(remoteIP net.IP, businessData string, zone string) error {
+	// 构造响应消息
+	msg := protocol.NewResponseMessage(&s.config.LocalDevice, businessData)
+
+	// 填充本机网络信息（默认接口）
+	if s.networkMgr != nil {
+		if def, err := s.networkMgr.GetDefaultInterface(); err == nil && def != nil {
+			msg.DeviceInfo.NetworkName = def.Name
+			for _, ip := range def.Addresses {
+				if ip.To4() != nil && !ip.IsLoopback() {
+					msg.DeviceInfo.NetworkIP = ip.String()
+					break
+				}
+			}
+		}
+	}
+
+	// 编码为JSON
+	data, err := msg.Encode()
+	if err != nil {
+		return fmt.Errorf("编码响应消息失败: %w", err)
+	}
+	// 构建带路径的CoAP响应报文（/device/response，Content-Format=JSON）
+	encoder := coap.NewEncoder()
+	raw := coap.CreateMessage(coap.TypeNonConfirmable, 0x45, uint16(time.Now().UnixNano()%65536))
+	// Uri-Path 分段添加："device", "response"
+	raw.AddOption(coap.OptionUriPath, []byte("device"))
+	raw.AddOption(coap.OptionUriPath, []byte("response"))
+	raw.AddOption(coap.OptionContentFormat, []byte{coap.ContentFormatJSON})
+	raw.SetPayload(data)
+	encoded, err := encoder.Encode(raw)
+	if err != nil {
+		return fmt.Errorf("编码CoAP响应报文失败: %w", err)
+	}
+
+	// 单播发送：IPv4 使用客户端；IPv6 走 MulticastHandler 的统一方法（携带 zone）
+	if remoteIP.To4() != nil {
+		if err := s.coapClient.SendUnicast(remoteIP, data); err != nil {
+			return fmt.Errorf("发送响应消息失败: %w", err)
+		}
+	} else {
+		// zone 回退：若未传入且为链路本地，使用默认接口名
+		if zone == "" && s.networkMgr != nil && remoteIP.IsLinkLocalUnicast() {
+			if def, err := s.networkMgr.GetDefaultInterface(); err == nil && def != nil {
+				zone = def.Name
+			}
+		}
+		if s.multicast != nil {
+			if err := s.multicast.SendUnicastIPv6(remoteIP, zone, encoded); err != nil {
+				return fmt.Errorf("发送IPv6响应消息失败: %w", err)
+			}
+		} else {
+			// 回退：直接 DialUDP6 发送
+			dst := &net.UDPAddr{IP: remoteIP, Port: coap.CoAPPort, Zone: zone}
+			conn, err := net.DialUDP("udp6", nil, dst)
+			if err != nil {
+				return fmt.Errorf("连接到IPv6地址失败: %w", err)
+			}
+			defer conn.Close()
+			if _, err := conn.Write(encoded); err != nil {
+				return fmt.Errorf("发送IPv6响应消息失败: %w", err)
+			}
+		}
+	}
+
+	// 统计与日志
+	s.stats.MessagesSent++
+	s.log.Debug("已发送发现响应",
+		zap.String("目标IP", remoteIP.String()),
+		zap.Int("响应长度", len(data)),
+		zap.String("zone", zone))
+
 	return nil
 }
 

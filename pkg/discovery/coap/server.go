@@ -2,25 +2,24 @@
 package coap
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
 	"sync"
-	"bytes"
 
 	"github.com/junbin-yang/nstackx-go/pkg/utils/logger"
 	"github.com/plgd-dev/go-coap/v3/message"
 	"github.com/plgd-dev/go-coap/v3/message/codes"
 	"github.com/plgd-dev/go-coap/v3/mux"
-	"github.com/plgd-dev/go-coap/v3/udp"
-	"github.com/plgd-dev/go-coap/v3/udp/server"
-	"github.com/plgd-dev/go-coap/v3/options"
-	coapNet "github.com/plgd-dev/go-coap/v3/net"
+	//coapNet "github.com/plgd-dev/go-coap/v3/net"
+	//"github.com/plgd-dev/go-coap/v3/options"
+	//"github.com/plgd-dev/go-coap/v3/udp"
+	//"github.com/plgd-dev/go-coap/v3/udp/server"
 	"go.uber.org/zap"
 )
 
 const (
-	DefaultCoAPPort    = 5683                // CoAP协议默认端口（UDP）
 	DiscoveryPath      = "/.well-known/core" // CoAP标准资源发现路径（RFC 6690）
 	DeviceDiscoverPath = "/device/discover"  // 自定义设备发现路径
 	DeviceResponsePath = "/device/response"  // 自定义设备响应路径（设备回复发现请求）
@@ -45,21 +44,22 @@ type MessageHandler func(*Message)
 type Server struct {
 	mu sync.RWMutex // 读写锁，保障多协程并发访问服务器资源的安全性
 
-	port     int                // 服务器监听端口（默认5683）
-	listener *server.Server     // UDP模式的CoAP服务器（基于go-coap/udp）
-	router   *mux.Router        // CoAP请求路由器（用于路径与处理器的映射）
-	handler  MessageHandler     // 外部设置的消息处理回调函数
-	ctx      context.Context    // 服务器上下文，用于控制生命周期
-	cancel   context.CancelFunc // 上下文取消函数，用于停止服务器
-	log      *logger.Logger     // 日志实例（基于zap框架）
+	multicast *MulticastHandler  // 多播处理器（用于发送广播消息）
+	handler   MessageHandler     // 外部设置的消息处理回调函数
+	ctx       context.Context    // 服务器上下文，用于控制生命周期
+	cancel    context.CancelFunc // 上下文取消函数，用于停止服务器
+	log       *logger.Logger     // 日志实例（基于zap框架）
 }
 
 // NewServer 创建CoAP服务器实例
 // 参数：handler - 消息处理回调函数（外部业务逻辑入口）
 // 返回：服务器实例，若handler为nil则返回错误
-func NewServer(handler MessageHandler) (*Server, error) {
+func NewServer(handler MessageHandler, multicast *MulticastHandler) (*Server, error) {
 	if handler == nil {
 		return nil, fmt.Errorf("消息处理回调函数不能为nil")
+	}
+	if multicast == nil {
+		return nil, fmt.Errorf("多播处理器不能为nil")
 	}
 
 	// 创建可取消的上下文，用于控制服务器生命周期
@@ -67,12 +67,11 @@ func NewServer(handler MessageHandler) (*Server, error) {
 
 	// 初始化服务器核心字段
 	s := &Server{
-		port:    DefaultCoAPPort,
-		handler: handler,
-		router:  mux.NewRouter(), // 创建CoAP路由实例
-		ctx:     ctx,
-		cancel:  cancel,
-		log:     logger.Default(),
+		multicast: multicast,
+		handler:   handler,
+		ctx:       ctx,
+		cancel:    cancel,
+		log:       logger.Default(),
 	}
 
 	// 配置预设路由（路径与处理函数的映射）
@@ -83,52 +82,27 @@ func NewServer(handler MessageHandler) (*Server, error) {
 
 // setupRoutes 配置CoAP服务器的路由映射，关联路径与对应的请求处理函数
 func (s *Server) setupRoutes() {
+	router := s.multicast.GetRouter()
+
 	// 资源发现端点：处理对/.well-known/core的请求（标准CoAP资源发现）
-	s.router.Handle(DiscoveryPath, mux.HandlerFunc(s.handleDiscovery))
+	router.Handle(DiscoveryPath, mux.HandlerFunc(s.handleDiscovery))
 
 	// 设备发现端点：处理对/device/discover的请求（自定义设备发现）
-	s.router.Handle(DeviceDiscoverPath, mux.HandlerFunc(s.handleDeviceDiscover))
+	router.Handle(DeviceDiscoverPath, mux.HandlerFunc(s.handleDeviceDiscover))
 
 	// 设备响应端点：处理对/device/response的请求（设备回复发现请求）
-	s.router.Handle(DeviceResponsePath, mux.HandlerFunc(s.handleDeviceResponse))
+	router.Handle(DeviceResponsePath, mux.HandlerFunc(s.handleDeviceResponse))
 
 	// 通知端点：处理对/notification的请求（设备状态变更通知）
-	s.router.Handle(NotificationPath, mux.HandlerFunc(s.handleNotification))
+	router.Handle(NotificationPath, mux.HandlerFunc(s.handleNotification))
 }
 
 // Start 启动CoAP服务器，开始监听指定端口的CoAP请求
 // 返回：启动失败则返回错误（如端口被占用、服务器已启动等）
-func (s *Server) Start() error {
+func (s *Server) Start() {
 	s.mu.Lock()         // 写锁：保障启动过程的线程安全
 	defer s.mu.Unlock() // 函数退出时释放锁
-
-	// 若服务器已启动（监听器非空），返回错误
-	if s.listener != nil {
-		return fmt.Errorf("服务器已启动")
-	}
-
-	// 构建监听地址（":端口"，监听所有网卡的该端口）
-	addr := fmt.Sprintf(":%d", s.port)
-	conn, err := coapNet.NewListenUDP("udp", addr)
-	if err != nil {
-                return fmt.Errorf("服务端口监听失败")
-        }
-
-	// 创建UDP模式的CoAP服务器：关联路由和上下文
-	s.listener = udp.NewServer(
-		options.WithMux(s.router),  // 绑定路由（请求分发依据）
-		options.WithContext(s.ctx), // 绑定上下文（生命周期控制）
-	)
-
-	// 启动协程监听请求（非阻塞，避免阻塞当前函数）
-	go func() {
-		if err := s.listener.Serve(conn); err != nil {
-			s.log.Error("CoAP服务器运行错误", zap.Error(err))
-		}
-	}()
-
-	s.log.Info("CoAP服务器启动成功", zap.String("监听地址", addr))
-	return nil
+	s.multicast.Start() // 启动多播处理器
 }
 
 // Stop 停止CoAP服务器，释放资源
@@ -136,27 +110,11 @@ func (s *Server) Stop() {
 	s.mu.Lock()         // 写锁：保障停止过程的线程安全
 	defer s.mu.Unlock() // 函数退出时释放锁
 
-	// 若服务器未启动（监听器为空），直接返回
-	if s.listener == nil {
-		return
-	}
-
 	// 触发上下文取消，通知所有依赖上下文的组件退出
 	s.cancel()
-	// 停止监听器，关闭UDP连接
-	s.listener.Stop()
-	// 清空监听器（标记服务器为停止状态）
-	s.listener = nil
+	s.multicast.Stop()
 
 	s.log.Info("CoAP服务器已停止")
-}
-
-// SetPort 设置服务器监听端口（需在启动前调用）
-func (s *Server) SetPort(port int) {
-	s.mu.Lock()         // 写锁：保障端口修改的线程安全
-	defer s.mu.Unlock() // 函数退出时释放锁
-
-	s.port = port
 }
 
 // handleDiscovery 处理资源发现请求（路径：/.well-known/core）
@@ -177,7 +135,7 @@ func (s *Server) handleDiscovery(w mux.ResponseWriter, r *mux.Message) {
 	response := w.Conn().AcquireMessage(r.Context())
 	defer w.Conn().ReleaseMessage(response)
 	response.SetCode(codes.Content)
-        response.SetToken(r.Token())
+	response.SetToken(r.Token())
 	response.SetContentFormat(message.TextPlain)
 	// 设置响应体（调用buildDiscoveryResponse生成资源列表）
 	response.SetBody(bytes.NewReader(s.buildDiscoveryResponse()))
@@ -268,4 +226,3 @@ func (s *Server) buildDiscoveryResponse() []byte {
 	// 示例：返回设备资源的链接格式（</device>;rt="nstackx.device"表示路径/device，类型为nstackx.device）
 	return []byte(`</device>;rt="nstackx.device"`)
 }
-
